@@ -1,10 +1,7 @@
-# src/data_processor.py
-
 import pandas as pd
 from typing import List
 import os
-import logging # NOVO IMPORT
-
+import logging
 # Define a tolerância para a inconsistência de PU
 TOLERANCE = 1e-6
 logger = logging.getLogger(__name__) # Obtém o logger configurado no main.py
@@ -19,6 +16,7 @@ class DataCleaner:
         self.required_columns = [col.strip() for col in required_columns] 
         self.df = self._load_data()
         
+                
     def _find_header_row(self) -> int:
         MAX_ROWS_TO_CHECK = 50 
         file_name = self.file_path.split(os.sep)[-1]
@@ -163,62 +161,89 @@ class ConsistencyChecker:
         # tenham um índice sequencial para o merge. 
         self.df_banco = df_banco.reset_index(drop=True)
         self.df_britech = df_britech.reset_index(drop=True)
+        self._validate_duplicate_keys()
         self.merged_df = self._merge_data_successive()
+    
+    def _validate_duplicate_keys(self):
+        duplicate_found = False
+        for key in ['ASSET_ID_VENC', 'ASSET_ID_APL']:
+            banco_dupes = self.df_banco[self.df_banco.duplicated(subset=[key], keep=False)]
+            britech_dupes = self.df_britech[self.df_britech.duplicated(subset=[key], keep=False)]
 
+            if not banco_dupes.empty or not britech_dupes.empty:
+                duplicate_found = True
+                logger.warning(
+                    f"[Validação] Chaves duplicadas encontradas para {key}: "
+                    f"Banco={len(banco_dupes)}, Britech={len(britech_dupes)}"
+                )
+                raise ValueError("Duplicidade de chave detectada no banco")
+
+            
+        if not duplicate_found:
+            logger.info("[Validação] Nenhuma duplicidade de chaves detectada.")
+    
     def _merge_data_successive(self) -> pd.DataFrame:
-        """ 
-        Realiza o MERGE sucessivo (Vencimento -> Aplicação) para capturar o máximo de ativos conciliados.
         """
-        keys = {
-            'VENCIMENTO': 'ASSET_ID_VENC', 
-            'APLICACAO': 'ASSET_ID_APL'
-        }
-        
-        # Usamos sets para armazenar as chaves de conciliação que já deram match
-        conciliated_ids = set()
-        df_conciliated = pd.DataFrame()
-        
-        for tipo, key in keys.items():
-            
-            # Filtra os DFs para manter apenas os ativos que AINDA NÃO FORAM CONCILIADOS
-            # O filtro é feito pelo ASSET_ID_VENC, que é a chave que define a prioridade de conciliação
-            # (mesmo que o match seja feito por ASSET_ID_APL no segundo loop)
-            df_banco_pending = self.df_banco[~self.df_banco['ASSET_ID_VENC'].isin(conciliated_ids)].copy()
-            df_britech_pending = self.df_britech[~self.df_britech['ASSET_ID_VENC'].isin(conciliated_ids)].copy()
-            
-            current_merge = pd.merge(
-                df_banco_pending, 
-                df_britech_pending, 
-                left_on=key, 
-                right_on=key, 
-                how='inner', 
-                suffixes=('_BANCO', '_BRITECH') 
-            )
-            
-            if not current_merge.empty:
-                logger.info(f"[Merge] {len(current_merge)} ativos conciliados por {tipo}.")
-                current_merge['ASSET_ID'] = current_merge[key]
-                current_merge['TIPO_ID_USADO'] = tipo
-                
-                # Atualiza os sets de IDs conciliados usando a chave VENCIMENTO (prioritária)
-                if tipo == 'VENCIMENTO':
-                    conciliated_ids.update(current_merge[key].unique())
-                else: 
-                    # Se conciliou por APLICAÇÃO, usamos a chave ASSET_ID_VENC_BANCO para evitar que 
-                    # esse ativo seja considerado novamente em merges futuros (embora não deva haver)
-                    conciliated_ids.update(current_merge['ASSET_ID_VENC_BANCO'].unique())
-                    
-                df_conciliated = pd.concat([df_conciliated, current_merge], ignore_index=True)
+        Merge sucessivo:
+        1º Vencimento
+        2º Aplicação (fallback)
+        """
 
-        cols_to_keep_final = [
-            'ASSET_ID', 'TIPO_ID_USADO', 'CODIGO_BANCO', 'APLICACAO_DATA_BANCO', 'VENCIMENTO_DATA_BANCO', 'QTD_BANCO', 'PU_BANCO', 'VALOR_BRUTO_BANCO',
-            'CODIGO_BRITECH', 'OPERACAO_DATA_BRITECH', 'VENCIMENTO_DATA_BRITECH', 'QTD_BRITECH', 'PU_BRITECH', 'VALOR_BRUTO_BRITECH'
+        df_final = pd.DataFrame()
+        used_asset_ids = set()
+
+        # ---------- 1º MERGE: VENCIMENTO ----------
+        merge_venc = pd.merge(
+            self.df_banco,
+            self.df_britech,
+            on='ASSET_ID_VENC',
+            how='inner',
+            suffixes=('_BANCO', '_BRITECH')
+        )
+
+        if not merge_venc.empty:
+            merge_venc['ASSET_ID'] = merge_venc['ASSET_ID_VENC']
+            merge_venc['TIPO_ID_USADO'] = 'VENCIMENTO'
+            used_asset_ids.update(merge_venc['ASSET_ID_VENC'].unique())
+            df_final = merge_venc.copy()
+
+        # ---------- 2º MERGE: APLICAÇÃO (FALLBACK) ----------
+        banco_pending = self.df_banco[
+            ~self.df_banco['ASSET_ID_VENC'].isin(used_asset_ids)
         ]
 
-        df_final = df_conciliated.reindex(columns=cols_to_keep_final).dropna(subset=['ASSET_ID']).drop_duplicates(subset=['ASSET_ID'])
-        
-        return df_final
+        britech_pending = self.df_britech[
+            ~self.df_britech['ASSET_ID_VENC'].isin(used_asset_ids)
+        ]
 
+        merge_apl = pd.merge(
+            banco_pending,
+            britech_pending,
+            on='ASSET_ID_APL',
+            how='inner',
+            suffixes=('_BANCO', '_BRITECH')
+        )
+
+        if not merge_apl.empty:
+            merge_apl['ASSET_ID'] = merge_apl['ASSET_ID_APL']
+            merge_apl['TIPO_ID_USADO'] = 'APLICACAO'
+            df_final = pd.concat([df_final, merge_apl], ignore_index=True)
+
+        # ---------- LIMPEZA FINAL ----------
+        cols_to_keep = [
+            'ASSET_ID', 'TIPO_ID_USADO',
+            'CODIGO_BANCO', 'APLICACAO_DATA_BANCO', 'VENCIMENTO_DATA_BANCO',
+            'QTD_BANCO', 'PU_BANCO', 'VALOR_BRUTO_BANCO',
+            'CODIGO_BRITECH', 'OPERACAO_DATA_BRITECH', 'VENCIMENTO_DATA_BRITECH',
+            'QTD_BRITECH', 'PU_BRITECH', 'VALOR_BRUTO_BRITECH'
+        ]
+
+        return (
+            df_final
+            .reindex(columns=cols_to_keep)
+            .drop_duplicates(subset=['ASSET_ID'])
+            .reset_index(drop=True)
+        )
 
     def get_comparison_dataframe(self) -> pd.DataFrame:
         """ Cria o DataFrame de comparação com cálculo de diferenças de PU e Valor. """
@@ -249,12 +274,3 @@ class ConsistencyChecker:
         """ Retorna apenas os ativos conciliados com inconsistência de PU/Valor. """
         df_completo = self.get_comparison_dataframe()
         return df_completo[df_completo['STATUS_INCONSISTENCIA'] == True].copy()
-        
-    def get_non_matched_dataframe(self) -> pd.DataFrame: 
-        """ Mantido como um método, mas retorna um DataFrame vazio conforme escopo final. """
-        COLUNAS_SAIDA = [
-            'ASSET_ID', 'STATUS_CONCILIACAO', 'TIPO_ID_USADO', 'CODIGO_BANCO', 'APLICACAO_DATA_BANCO', 'VENCIMENTO_DATA_BANCO',
-            'QTD_BANCO', 'PU_BANCO', 'VALOR_BRUTO_BANCO', 'CODIGO_BRITECH', 'OPERACAO_DATA_BRITECH', 
-            'VENCIMENTO_DATA_BRITECH', 'QTD_BRITECH', 'PU_BRITECH', 'VALOR_BRUTO_BRITECH'
-        ]
-        return pd.DataFrame(columns=COLUNAS_SAIDA)
